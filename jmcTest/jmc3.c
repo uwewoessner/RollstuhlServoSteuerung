@@ -21,7 +21,7 @@
 // Application parameters
 #define FREQUENCY 1000
 #define CLOCK_TO_USE CLOCK_MONOTONIC
-#define MEASURE_TIMING
+//#define MEASURE_TIMING
 
 /****************************************************************************/
 
@@ -40,21 +40,19 @@ static struct {
     unsigned int ctrl_word;
     unsigned int target_torque;
     unsigned int op_mode;
-    unsigned int direction;
     unsigned int status_word;
     unsigned int act_velocity;
     unsigned int act_position;
 } offset;
-#define AkdSlavePos    0,0  /* EtherCAT address on the bus */
+#define JMCSlavePos    0,0  /* EtherCAT address on the bus */
 
 const static ec_pdo_entry_reg_t domain1_regs[] = {
-    { AkdSlavePos, JMCDrive, 0x6040, 0, &offset.ctrl_word },
-    { AkdSlavePos, JMCDrive, 0x6060, 0, &offset.op_mode },
-    { AkdSlavePos, JMCDrive, 0x6071, 0, &offset.target_torque },
-    { AkdSlavePos, JMCDrive, 0x607e, 0, &offset.direction },
-    { AkdSlavePos, JMCDrive, 0x6041, 0, &offset.status_word },
-    { AkdSlavePos, JMCDrive, 0x606C, 0, &offset.act_velocity },
-    { AkdSlavePos, JMCDrive, 0x6064, 0, &offset.act_position },
+    { JMCSlavePos, JMCDrive, 0x6040, 0, &offset.ctrl_word },
+    { JMCSlavePos, JMCDrive, 0x6060, 0, &offset.op_mode },
+    { JMCSlavePos, JMCDrive, 0x6071, 0, &offset.target_torque },
+    { JMCSlavePos, JMCDrive, 0x6041, 0, &offset.status_word },
+    { JMCSlavePos, JMCDrive, 0x606C, 0, &offset.act_velocity },
+    { JMCSlavePos, JMCDrive, 0x6064, 0, &offset.act_position },
     {}
 };
 
@@ -64,7 +62,6 @@ ec_pdo_entry_info_t akd_pdo_entries[] = {
     { 0x6040, 0x00, 16 }, /* DS402 command word */
     { 0x6060, 0x00, 8 }, /* op mode */
     { 0x6071, 0x00, 16 }, /* target torque, in 1/1000 of nominal torque */
-    { 0x607e, 0x00, 8 }, /* direction */
     /* TxPDO 0x1a00 */
     { 0x6041, 0x00, 16 }, /* DS402 status word */
     { 0x606C, 0x00, 32 }, /* actual velocity, in rpm */
@@ -72,8 +69,8 @@ ec_pdo_entry_info_t akd_pdo_entries[] = {
 };
 
 ec_pdo_info_t akd_pdos[] = {
-    { 0x1600, 4, akd_pdo_entries + 0 },
-    { 0x1a00, 3, akd_pdo_entries + 4 },
+    { 0x1600, 3, akd_pdo_entries + 0 },
+    { 0x1a00, 3, akd_pdo_entries + 3 },
 };
 
 /*ec_sync_info_t jmc_syncs[] = {
@@ -102,7 +99,6 @@ static ec_domain_state_t domain1_state = {};
 // process data
 static uint8_t *domain1_pd = NULL;
 
-#define BusCouplerPos    0, 0
 
 
 static uint32_t actualPos = 0;
@@ -180,7 +176,8 @@ void cyclic_task()
     // get current time
     clock_gettime(CLOCK_TO_USE, &wakeupTime);
 
-    while(1) {
+    while(1)
+    {
         wakeupTime = timespec_add(wakeupTime, cycletime);
         clock_nanosleep(CLOCK_TO_USE, TIMER_ABSTIME, &wakeupTime, NULL);
 
@@ -224,6 +221,8 @@ void cyclic_task()
 
         // check process data state (optional)
         check_domain1_state();
+        // readPos
+        actualPos = EC_READ_U32(domain1_pd + offset.act_position);
 
         if (counter2) {
             counter2--;
@@ -231,31 +230,30 @@ void cyclic_task()
             counter2 = FREQUENCY/10;
             if(master_state.al_states == 0x08)
             {
-            // calculate new process data
-            if(blink)
-            currentTorque++;
-            else
-            currentTorque--;
-            if(currentTorque > 100)
-            {
-                blink = !blink;
-                currentTorque = 100;
+              // calculate new process data
+              if(blink)
+              currentTorque++;
+              else
+              currentTorque--;
+              if(currentTorque > 100)
+              {
+                  blink = !blink;
+                  currentTorque = 100;
+              }
+              if(currentTorque < -100)
+              {
+                  blink = !blink;
+                  currentTorque = -100;
+              }
             }
-            if(currentTorque < -100)
-            {
-                blink = !blink;
-                currentTorque = -100;
-            }
-            if(currentTorque > 0)
-                dir = 0x0;
-            else
-                dir=0xff;
-            } 
         }
 
-        if (counter) {
+        if (counter)
+        {
             counter--;
-        } else { // do this at 1 Hz
+        }
+        else
+        { // do this at 1 Hz
             counter = FREQUENCY;
 
      
@@ -263,42 +261,41 @@ void cyclic_task()
             check_master_state();
             if(master_state.al_states == 0x08)
             {
-            printf("actualPos: %d\n",actualPos);
-            printf("actualtorque: %d\n",currentTorque);
-            printf("dir: %d\n",dir);
+              float angle = (actualPos%10000)/10000.0 * 360.0;
+              printf("actualPos: %6d %f°\n",actualPos,angle);
+              printf("actualtorque: %d\n",currentTorque);
 #ifdef MEASURE_TIMING
-            // output timing stats
-            printf("period     %10u ... %10u\n",
-                    period_min_ns, period_max_ns);
-            printf("exec       %10u ... %10u\n",
-                    exec_min_ns, exec_max_ns);
-            printf("latency    %10u ... %10u\n",
-                    latency_min_ns, latency_max_ns);
-            period_max_ns = 0;
-            period_min_ns = 0xffffffff;
-            exec_max_ns = 0;
-            exec_min_ns = 0xffffffff;
-            latency_max_ns = 0;
-            latency_min_ns = 0xffffffff;
+              // output timing stats
+              printf("period     %10u ... %10u\n",
+                      period_min_ns, period_max_ns);
+              printf("exec       %10u ... %10u\n",
+                      exec_min_ns, exec_max_ns);
+              printf("latency    %10u ... %10u\n",
+                      latency_min_ns, latency_max_ns);
+              period_max_ns = 0;
+              period_min_ns = 0xffffffff;
+              exec_max_ns = 0;
+              exec_min_ns = 0xffffffff;
+              latency_max_ns = 0;
+              latency_min_ns = 0xffffffff;
 #endif
              }
 
         }
-        dir=0xff;
 
         // write process data
         EC_WRITE_U16(domain1_pd + offset.ctrl_word, 0x000f);
-        EC_WRITE_S16(domain1_pd + offset.target_torque, currentTorque);
+        EC_WRITE_S16(domain1_pd + offset.target_torque, currentTorque); // torque is actually a signed 16 bit value in 1/1000 or rated torque
         //EC_WRITE_U8(domain1_pd + offset.op_mode, 10);
         EC_WRITE_U8(domain1_pd + offset.op_mode, 10);
-        EC_WRITE_U8(domain1_pd + offset.direction, dir);
-        // readPos
-        actualPos = EC_READ_U32(domain1_pd + offset.act_position);
 
 
-        if (sync_ref_counter) {
+        if (sync_ref_counter)
+        {
             sync_ref_counter--;
-        } else {
+        }
+        else
+        {
             sync_ref_counter = 1; // sync every cycle
 
             clock_gettime(CLOCK_TO_USE, &time);
@@ -369,12 +366,12 @@ int main(int argc, char **argv)
         return -1;
 
     // Create configuration for bus coupler
-    sc = ecrt_master_slave_config(master, BusCouplerPos, JMCDrive);
+    sc = ecrt_master_slave_config(master, JMCSlavePos, JMCDrive);
     if (!sc)
         return -1;
 
     /* Configure AKD flexible PDO */
-    printf("Configuring AKD with flexible PDO...\n");
+    printf("Configuring flexible PDO...\n");
     /* Clear RxPdo */
     ecrt_slave_config_sdo8( sc, 0x1C12, 0, 0 ); /* clear sm pdo 0x1c12 */
     ecrt_slave_config_sdo8( sc, 0x1600, 0, 0 ); /* clear RxPdo 0x1600 */
@@ -386,7 +383,6 @@ int main(int argc, char **argv)
     ecrt_slave_config_sdo32( sc, 0x1600, 1, 0x60400010 ); /* 0x6040:0/16bits, control word */
     ecrt_slave_config_sdo32( sc, 0x1600, 2, 0x60600008 ); /* 0x6060:0/8bits op mode*/
     ecrt_slave_config_sdo32( sc, 0x1600, 3, 0x60710010 ); /* 0x6071:0/16bits target torque*/
-    ecrt_slave_config_sdo32( sc, 0x1600, 4, 0x607e0008 ); /* 0x607e:0/8bits direction*/
     ecrt_slave_config_sdo8( sc, 0x1600, 0, 4 ); /* set number of PDO entries for 0x1600 */
 
     ecrt_slave_config_sdo16( sc, 0x1C12, 1, 0x1600 ); /* list all RxPdo in 0x1C12:1-4 */
@@ -414,14 +410,16 @@ int main(int argc, char **argv)
 
 
     printf("Configuring PDOs...\n");
-    if ( ecrt_slave_config_pdos( sc, EC_END, jmc_syncs ) ) {
+    if ( ecrt_slave_config_pdos( sc, EC_END, jmc_syncs ) )
+    {
         fprintf( stderr, "Failed to configure JMC PDOs.\n" );
         exit( EXIT_FAILURE );
     }
     
 
     printf("registering PDOs...\n");
-    if ( ecrt_domain_reg_pdo_entry_list( domain1, domain1_regs ) ) {
+    if ( ecrt_domain_reg_pdo_entry_list( domain1, domain1_regs ) )
+    {
         fprintf( stderr, "PDO entry registration failed!\n" );
         exit( EXIT_FAILURE );
     }
@@ -434,7 +432,8 @@ int main(int argc, char **argv)
     }
 
     printf("registering PDOs...\n");
-    if ( ecrt_domain_reg_pdo_entry_list( domain1, domain1_regs ) ) {
+    if ( ecrt_domain_reg_pdo_entry_list( domain1, domain1_regs ) )
+    {
         fprintf( stderr, "PDO entry registration failed!\n" );
         exit( EXIT_FAILURE );
     }

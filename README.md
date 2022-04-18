@@ -14,3 +14,6 @@ and generate /dev/EtherCAT0
 add the following line to /etc/udev/rules.d
 KERNEL=="EtherCAT[0 -9]*", MODE="0664", GROUP="users"
 
+
+after a restart of the servo:
+ethercat rescan
