@@ -10,24 +10,37 @@
 #include <sys/mman.h>
 #include <malloc.h>
 #include <string.h>
+#include <limits.h>
 #include <sched.h> /* sched_setscheduler() */
+#include "myTime.h"
+#include "Filters.h"
+#include <sys/types.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "UDPComm.h"
+long myTimeCT=0;
 
 /****************************************************************************/
 
 #include "ecrt.h"
 
 /****************************************************************************/
-
+#define MAX_TORQUE 800
 // Application parameters
 #define FREQUENCY 1000
 #define CLOCK_TO_USE CLOCK_MONOTONIC
 //#define MEASURE_TIMING
+const int counterResolution=30000;
 
 /****************************************************************************/
 
 #define NSEC_PER_SEC (1000000000L)
 #define PERIOD_NS (NSEC_PER_SEC / FREQUENCY)
 
+const double dt = 1.0/FREQUENCY;
 #define DIFF_NS(A, B) (((B).tv_sec - (A).tv_sec) * NSEC_PER_SEC + \
         (B).tv_nsec - (A).tv_nsec)
 
@@ -44,15 +57,26 @@ static struct {
     unsigned int act_velocity;
     unsigned int act_position;
 } offset;
-#define JMCSlavePos    0,0  /* EtherCAT address on the bus */
+#define JMCSlave1Pos    0,0  /* EtherCAT address on the bus */
+#define JMCSlave2Pos    0,1  /* EtherCAT address on the bus */
 
 const static ec_pdo_entry_reg_t domain1_regs[] = {
-    { JMCSlavePos, JMCDrive, 0x6040, 0, &offset.ctrl_word },
-    { JMCSlavePos, JMCDrive, 0x6060, 0, &offset.op_mode },
-    { JMCSlavePos, JMCDrive, 0x6071, 0, &offset.target_torque },
-    { JMCSlavePos, JMCDrive, 0x6041, 0, &offset.status_word },
-    { JMCSlavePos, JMCDrive, 0x606C, 0, &offset.act_velocity },
-    { JMCSlavePos, JMCDrive, 0x6064, 0, &offset.act_position },
+    { JMCSlave1Pos, JMCDrive, 0x6040, 0, &offset.ctrl_word },
+    { JMCSlave1Pos, JMCDrive, 0x6060, 0, &offset.op_mode },
+    { JMCSlave1Pos, JMCDrive, 0x6071, 0, &offset.target_torque },
+    { JMCSlave1Pos, JMCDrive, 0x6041, 0, &offset.status_word },
+    { JMCSlave1Pos, JMCDrive, 0x606C, 0, &offset.act_velocity },
+    { JMCSlave1Pos, JMCDrive, 0x6064, 0, &offset.act_position },
+    {}
+};
+
+const static ec_pdo_entry_reg_t domain2_regs[] = {
+    { JMCSlave2Pos, JMCDrive, 0x6040, 0, &offset.ctrl_word },
+    { JMCSlave2Pos, JMCDrive, 0x6060, 0, &offset.op_mode },
+    { JMCSlave2Pos, JMCDrive, 0x6071, 0, &offset.target_torque },
+    { JMCSlave2Pos, JMCDrive, 0x6041, 0, &offset.status_word },
+    { JMCSlave2Pos, JMCDrive, 0x606C, 0, &offset.act_velocity },
+    { JMCSlave2Pos, JMCDrive, 0x6064, 0, &offset.act_position },
     {}
 };
 
@@ -92,21 +116,26 @@ static ec_master_t *master = NULL;
 static ec_master_state_t master_state = {};
 
 static ec_domain_t *domain1 = NULL;
+static ec_domain_t *domain2 = NULL;
 static ec_domain_state_t domain1_state = {};
+static ec_domain_state_t domain2_state = {};
 
 /****************************************************************************/
 
 // process data
 static uint8_t *domain1_pd = NULL;
+static uint8_t *domain2_pd = NULL;
 
 
 
-static uint32_t actualPos = 0;
+static uint32_t actualPos1 = 0;
+static uint32_t actualPos2 = 0;
 static unsigned int counter = 0;
 static unsigned int counter2 = 0;
 static unsigned int blink = 0;
 static unsigned int sync_ref_counter = 0;
 const struct timespec cycletime = {0, PERIOD_NS};
+const struct timespec startupcycletime = {0, PERIOD_NS*1};
 
 /*****************************************************************************/
 
@@ -140,6 +169,20 @@ void check_domain1_state(void)
 
     domain1_state = ds;
 }
+void check_domain2_state(void)
+{
+    ec_domain_state_t ds;
+
+    ecrt_domain_state(domain2, &ds);
+
+    if (ds.working_counter != domain2_state.working_counter)
+        printf("Domain2: WC %u.\n", ds.working_counter);
+    if (ds.wc_state != domain2_state.wc_state)
+        printf("Domain2: State %u.\n", ds.wc_state);
+
+    domain2_state = ds;
+}
+
 
 /*****************************************************************************/
 
@@ -159,8 +202,30 @@ void check_master_state(void)
     master_state = ms;
 }
 int currentTorque = 0;
+float v = 0;
+float a = 0;
+float m = 90;
+float currentPos = 0;
+uint32_t lastPos1 = 0;
+uint32_t lastPos2 = 0;
 uint8_t dir = 0x0;
 /****************************************************************************/
+FilterOnePole filter1;
+FilterOnePole filter2;
+UDPComm *toCOVER;
+UDPComm *toBroadcast;
+
+const int coverPort = 31319;
+const int pluginPort = 31324;
+std::string DeviceName="Rollstuhl";
+
+void sendDeviceInfo(UDPComm *comm)
+{
+  std::string buffer="devInfo "+DeviceName;
+  const char *b = buffer.c_str();
+  comm->send(b, buffer.length()+1);
+}
+
 
 void cyclic_task()
 {
@@ -175,9 +240,20 @@ void cyclic_task()
 
     // get current time
     clock_gettime(CLOCK_TO_USE, &wakeupTime);
+    bool initPos = true;
+    double f = 0;
+    double ds1 = 0;
+    double ds2 = 0;
+    int64_t countDiff1 = 0;
+    int64_t countDiff2 = 0;
+    bool startup = true;
 
     while(1)
     {
+        incTime();
+        if(startup)
+        wakeupTime = timespec_add(wakeupTime, startupcycletime);
+        else
         wakeupTime = timespec_add(wakeupTime, cycletime);
         clock_nanosleep(CLOCK_TO_USE, TIMER_ABSTIME, &wakeupTime, NULL);
 
@@ -218,35 +294,73 @@ void cyclic_task()
         // receive process data
         ecrt_master_receive(master);
         ecrt_domain_process(domain1);
+        ecrt_domain_process(domain2);
 
         // check process data state (optional)
         check_domain1_state();
+        check_domain2_state();
+       if(master_state.al_states == 0x08)
+       {
+        startup=false;
         // readPos
-        actualPos = EC_READ_U32(domain1_pd + offset.act_position);
+        actualPos1 = EC_READ_U32(domain1_pd + offset.act_position);
+        actualPos2 = EC_READ_U32(domain2_pd + offset.act_position);
+        if(initPos)
+        {
+            lastPos1 = actualPos1;
+            lastPos2 = actualPos2;
+            initPos=false;
+        }
+        countDiff1 = actualPos1 - lastPos1;
+        if(abs(countDiff1) > 1000000)
+        {
+           fprintf(stderr,"overrunn1\n");
+           if(actualPos1 > lastPos1)
+               countDiff1 = ((int64_t)actualPos1 - UINT_MAX) - lastPos1;
+           else
+               countDiff1 = actualPos1 - ((int64_t)lastPos1 - UINT_MAX) ;
+        }
+        countDiff2 = actualPos2 - lastPos2;
+        if(abs(countDiff2) > 1000000)
+        {
+           fprintf(stderr,"overrunn2\n");
+           if(actualPos2 > lastPos2)
+               countDiff2 = ((int64_t)actualPos2 - UINT_MAX) - lastPos2;
+           else
+               countDiff2 = actualPos2 - ((int64_t)lastPos2 - UINT_MAX) ;
+        }
+        lastPos1 = actualPos1;
+        lastPos2 = actualPos2;
+        filter1.input(((double)((int)countDiff1) / (double)counterResolution) * -0.314159265358979323846264338);// (M_PI*D)
+        filter2.input(((double)((int)countDiff2) / (double)counterResolution) * -0.314159265358979323846264338);// (M_PI*D)
+        ds1 =  filter1.output();
+        ds2 =  filter1.output();
+        //reibung + Luftwiderstand
+        f = -v * 0.001;
+        a =  f/m;
+        v = v - a*dt;
+        double dsTarget = v*dt;
+        currentTorque = (dsTarget - ds1) * -1000000000.0;
+        //fprintf(stderr,"dsTarget %f\n",(float)(dsTarget - ds1)*1000000000.0);
+        fprintf(stderr,"dsTarget %d\n",currentTorque);
+        currentTorque = 0;
+        v = (ds1)/dt;
+        
 
         if (counter2) {
             counter2--;
         } else { // do this at 100 Hz
             counter2 = FREQUENCY/100;
-            if(master_state.al_states == 0x08)
-            {
-              // calculate new process data
-              if(blink)
-              currentTorque++;
-              else
-              currentTorque--;
-              if(currentTorque > 500)
-              {
-                  blink = !blink;
-                  currentTorque = 500;
-              }
-              if(currentTorque < -500)
-              {
-                  blink = !blink;
-                  currentTorque = -500;
-              }
-            }
         }
+        if(currentTorque > MAX_TORQUE)
+        {
+            currentTorque = MAX_TORQUE;
+        }
+        if(currentTorque < -MAX_TORQUE)
+        {
+            currentTorque = -MAX_TORQUE;
+        }
+       }
 
         if (counter)
         {
@@ -255,15 +369,17 @@ void cyclic_task()
         else
         { // do this at 1 Hz
             counter = FREQUENCY;
+            counter = 100;
 
      
             // check for master state (optional)
             check_master_state();
             if(master_state.al_states == 0x08)
             {
-              float angle = (actualPos%10000)/10000.0 * 360.0;
-              printf("actualPos: %6d %f°\n",actualPos,angle);
-              printf("actualtorque: %d\n",currentTorque);
+              float angle1 = (actualPos1%30000)/30000.0 * 360.0;
+              float angle2 = (actualPos2%30000)/30000.0 * 360.0;
+              //printf("actualPos: l %6d %3.3f° r %6d %3.3f°\n",actualPos1,angle1,actualPos2,angle2);
+              printf("actualtorque: %d v%f a%f ds1%f %d\n",currentTorque,v,a,ds1,countDiff1);
 #ifdef MEASURE_TIMING
               // output timing stats
               printf("period     %10u ... %10u\n",
@@ -285,9 +401,12 @@ void cyclic_task()
 
         // write process data
         EC_WRITE_U16(domain1_pd + offset.ctrl_word, 0x000f);
+        EC_WRITE_U16(domain2_pd + offset.ctrl_word, 0x000f);
         EC_WRITE_S16(domain1_pd + offset.target_torque, currentTorque); // torque is actually a signed 16 bit value in 1/1000 or rated torque
+        EC_WRITE_S16(domain2_pd + offset.target_torque, currentTorque); // torque is actually a signed 16 bit value in 1/1000 or rated torque
         //EC_WRITE_U8(domain1_pd + offset.op_mode, 10);
         EC_WRITE_U8(domain1_pd + offset.op_mode, 10);
+        EC_WRITE_U8(domain2_pd + offset.op_mode, 10);
 
 
         if (sync_ref_counter)
@@ -305,6 +424,7 @@ void cyclic_task()
 
         // send process data
         ecrt_domain_queue(domain1);
+        ecrt_domain_queue(domain2);
         ecrt_master_send(master);
 
 #ifdef MEASURE_TIMING
@@ -313,8 +433,8 @@ void cyclic_task()
     }
 }
 
-    ec_slave_config_t *sc;
-void setSDO8(int index, int subindex, uint8_t data)
+    ec_slave_config_t *scs[2];
+void setSDO8(ec_slave_config_t *sc ,int index, int subindex, uint8_t data)
 {
  uint32_t abort_code;
     int ret=0;
@@ -325,7 +445,7 @@ void setSDO8(int index, int subindex, uint8_t data)
     }
     ecrt_slave_config_sdo8( sc, index, subindex, data);
 }
-void setSDO16(int index, int subindex, uint16_t data)
+void setSDO16(ec_slave_config_t *sc ,int index, int subindex, uint16_t data)
 {
  uint32_t abort_code;
     int ret=0;
@@ -336,7 +456,7 @@ void setSDO16(int index, int subindex, uint16_t data)
     }
     ecrt_slave_config_sdo16( sc, index, subindex, data);
 }
-void setSDO32(int index, int subindex, uint32_t data)
+void setSDO32(ec_slave_config_t *sc ,int index, int subindex, uint32_t data)
 {
  uint32_t abort_code;
     int ret=0;
@@ -347,31 +467,8 @@ void setSDO32(int index, int subindex, uint32_t data)
     }
     ecrt_slave_config_sdo32( sc, index, subindex, data);
 }
-/****************************************************************************/
-
-int main(int argc, char **argv)
+void configureSlaves(ec_slave_config_t *sc)
 {
-
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
-        perror("mlockall failed");
-        return -1;
-    }
-
-    master = ecrt_request_master(0);
-    if (!master)
-        return -1;
-
-    domain1 = ecrt_master_create_domain(master);
-    if (!domain1)
-        return -1;
-
-    // Create configuration for bus coupler
-    sc = ecrt_master_slave_config(master, JMCSlavePos, JMCDrive);
-    if (!sc)
-        return -1;
-
-    /* Configure AKD flexible PDO */
-    printf("Configuring flexible PDO...\n");
     /* Clear RxPdo */
     ecrt_slave_config_sdo8( sc, 0x1C12, 0, 0 ); /* clear sm pdo 0x1c12 */
     ecrt_slave_config_sdo8( sc, 0x1600, 0, 0 ); /* clear RxPdo 0x1600 */
@@ -408,12 +505,89 @@ int main(int argc, char **argv)
     //ecrt_slave_config_dc(sc, 0x0700, PERIOD_NS, 4400000, 0, 0);
     ecrt_slave_config_dc(sc, 0x0300, PERIOD_NS, 500000, 0, 0);
 
+}
+/****************************************************************************/
+
+int main(int argc, char **argv)
+{
+
+struct ifaddrs *addrs,*tmp;
+
+getifaddrs(&addrs);
+tmp = addrs;
+std::string ifName;
+if(argc == 2)
+{
+    ifName = argv[1];
+}
+
+toCOVER = NULL;
+toBroadcast = NULL;
+while (tmp)
+{
+    if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET)
+    {
+        if(tmp->ifa_flags & IFF_BROADCAST)
+        {
+            if(ifName.length()==0 || ifName == std::string(tmp->ifa_name))
+            {
+                printf("%d\n", tmp->ifa_ifu.ifu_broadaddr);
+                printf(" using interface %s\n", tmp->ifa_name);
+                printf(" using interface %s\n", inet_ntoa((in_addr)htonl(*((in_addr *)tmp->ifa_addr->sa_data))));
+                toBroadcast = new UDPComm(inet_ntoa((in_addr)htonl(*((in_addr *)tmp->ifa_addr->sa_data))),coverPort,pluginPort);
+                break;
+            }
+        }
+    }
+
+    tmp = tmp->ifa_next;
+}
+if(toBroadcast==NULL)
+{
+    std::cerr << "no interface found" << std::endl;
+}
+sendDeviceInfo(toBroadcast);
+
+freeifaddrs(addrs);
+
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
+        perror("mlockall failed");
+        return -1;
+    }
+
+    master = ecrt_request_master(0);
+    if (!master)
+        return -1;
+
+    domain1 = ecrt_master_create_domain(master);
+    if (!domain1)
+        return -1;
+
+    domain2 = ecrt_master_create_domain(master);
+    if (!domain2)
+        return -1;
+
+    // Create configuration for bus coupler
+    scs[0] = ecrt_master_slave_config(master, JMCSlave1Pos, JMCDrive);
+    if (!scs[0])
+        return -1;
+    scs[1] = ecrt_master_slave_config(master, JMCSlave2Pos, JMCDrive);
+    if (!scs[1])
+        return -1;
+
+    /* Configure AKD flexible PDO */
+    printf("Configuring flexible PDO...\n");
+    configureSlaves(scs[0]);
+    configureSlaves(scs[1]);
 
     printf("Configuring PDOs...\n");
-    if ( ecrt_slave_config_pdos( sc, EC_END, jmc_syncs ) )
+    for(int i=0;i<2;i++)
     {
-        fprintf( stderr, "Failed to configure JMC PDOs.\n" );
-        exit( EXIT_FAILURE );
+        if ( ecrt_slave_config_pdos( scs[i], EC_END, jmc_syncs ) )
+        {
+            fprintf( stderr, "Failed to configure JMC PDOs of drive %d.\n",i );
+            exit( EXIT_FAILURE );
+        }
     }
     
 
@@ -423,6 +597,12 @@ int main(int argc, char **argv)
         fprintf( stderr, "PDO entry registration failed!\n" );
         exit( EXIT_FAILURE );
     }
+    if ( ecrt_domain_reg_pdo_entry_list( domain2, domain2_regs ) )
+    {
+        fprintf( stderr, "PDO entry registration failed!\n" );
+        exit( EXIT_FAILURE );
+    }
+
 
     printf("Activating master...\n");
     if (ecrt_master_activate(master))
@@ -431,16 +611,14 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    printf("registering PDOs...\n");
-    if ( ecrt_domain_reg_pdo_entry_list( domain1, domain1_regs ) )
-    {
-        fprintf( stderr, "PDO entry registration failed!\n" );
-        exit( EXIT_FAILURE );
-    }
-
+    printf("done Activating master...\n");
     if (!(domain1_pd = ecrt_domain_data(domain1))) {
         return -1;
     }
+    if (!(domain2_pd = ecrt_domain_data(domain2))) {
+        return -1;
+    }
+
 
     /* Set priority */
 
