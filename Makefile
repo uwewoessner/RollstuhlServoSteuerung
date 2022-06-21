@@ -1,7 +1,7 @@
 all: wheelchair calibrate
 
 wheelchair: wheelchair.cpp FilterOnePole.o FilterTwoPole.o UDPComm.o myTime.h
-	g++ wheelchair.cpp  FilterOnePole.o FilterTwoPole.o UDPComm.o /usr/local/lib/libethercat.a -I ../ethercat -o wheelchair
+	g++ wheelchair.cpp  FilterOnePole.o FilterTwoPole.o UDPComm.o /usr/local/lib/libethercat.a -lpthread -I ../ethercat -o wheelchair
 
 calibrate: calibrate.cpp FilterOnePole.o FilterTwoPole.o myTime.h
 	g++ calibrate.cpp  FilterOnePole.o FilterTwoPole.o /usr/local/lib/libethercat.a -I ../ethercat -o calibrate

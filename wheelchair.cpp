@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "UDPComm.h"
+#include <thread>
 long myTimeCT=0;
 
 /****************************************************************************/
@@ -162,10 +163,10 @@ void check_domain1_state(void)
 
     ecrt_domain_state(domain1, &ds);
 
-    if (ds.working_counter != domain1_state.working_counter)
-        printf("Domain1: WC %u.\n", ds.working_counter);
-    if (ds.wc_state != domain1_state.wc_state)
-        printf("Domain1: State %u.\n", ds.wc_state);
+    //if (ds.working_counter != domain1_state.working_counter)
+    //    printf("Domain1: WC %u.\n", ds.working_counter);
+    //if (ds.wc_state != domain1_state.wc_state)
+    //    printf("Domain1: State %u.\n", ds.wc_state);
 
     domain1_state = ds;
 }
@@ -175,10 +176,10 @@ void check_domain2_state(void)
 
     ecrt_domain_state(domain2, &ds);
 
-    if (ds.working_counter != domain2_state.working_counter)
-        printf("Domain2: WC %u.\n", ds.working_counter);
-    if (ds.wc_state != domain2_state.wc_state)
-        printf("Domain2: State %u.\n", ds.wc_state);
+    //if (ds.working_counter != domain2_state.working_counter)
+    //    printf("Domain2: WC %u.\n", ds.working_counter);
+    //if (ds.wc_state != domain2_state.wc_state)
+    //    printf("Domain2: State %u.\n", ds.wc_state);
 
     domain2_state = ds;
 }
@@ -212,20 +213,69 @@ uint8_t dir = 0x0;
 /****************************************************************************/
 FilterOnePole filter1;
 FilterOnePole filter2;
+sockaddr_in COVERAddr;
 UDPComm *toCOVER;
 UDPComm *toBroadcast;
+std::string myAddress;
 
 const int coverPort = 31319;
-const int pluginPort = 31324;
-std::string DeviceName="Rollstuhl";
+const int pluginPort = 31321;
+std::string DeviceName="Wheelchair";
+bool running=true;
+
+struct messageBuffer
+{
+  int64_t countLeft;
+  int64_t countRight;
+  uint32_t state;
+};
+
+struct messageBuffer mb;
 
 void sendDeviceInfo(UDPComm *comm)
 {
-  std::string buffer="devInfo "+DeviceName;
+  std::string buffer="devInfo "+DeviceName+" "+myAddress;
   const char *b = buffer.c_str();
   comm->send(b, buffer.length()+1);
 }
 
+void processUDP()
+{
+    char buffer[100];
+    while(running)
+    {
+       int numRead = toBroadcast->receive(buffer,100,0);
+       if(numRead > 0)
+       {
+          if(numRead >= 5)
+          {
+            if(strcmp(buffer,"enum")==0)
+            {
+              sendDeviceInfo(toBroadcast);
+            }
+            if(strcmp(buffer,"start")==0)
+            {
+              if(toCOVER != nullptr)
+                  delete toCOVER;
+              COVERAddr = toBroadcast->getRemoteAddess();
+                char *addr = inet_ntoa(COVERAddr.sin_addr);
+                printf("COVER: %s\n", addr);
+                toCOVER = new UDPComm(addr,pluginPort,pluginPort);
+
+            }
+            if(strcmp(buffer,"stop")==0)
+            {
+              toCOVER = NULL;
+            }
+          }
+       }
+       if(toCOVER)
+       {
+       numRead = toCOVER->receive(buffer,100,0.1);
+       toCOVER->send(&mb, sizeof(mb));
+       }
+    }
+}
 
 void cyclic_task()
 {
@@ -244,8 +294,8 @@ void cyclic_task()
     double f = 0;
     double ds1 = 0;
     double ds2 = 0;
-    int64_t countDiff1 = 0;
-    int64_t countDiff2 = 0;
+    int32_t countDiff1 = 0;
+    int32_t countDiff2 = 0;
     bool startup = true;
 
     while(1)
@@ -331,6 +381,9 @@ void cyclic_task()
         }
         lastPos1 = actualPos1;
         lastPos2 = actualPos2;
+        mb.countLeft = actualPos1;
+        mb.countRight = actualPos2;
+
         filter1.input(((double)((int)countDiff1) / (double)counterResolution) * -0.314159265358979323846264338);// (M_PI*D)
         filter2.input(((double)((int)countDiff2) / (double)counterResolution) * -0.314159265358979323846264338);// (M_PI*D)
         ds1 =  filter1.output();
@@ -342,7 +395,7 @@ void cyclic_task()
         double dsTarget = v*dt;
         currentTorque = (dsTarget - ds1) * -1000000000.0;
         //fprintf(stderr,"dsTarget %f\n",(float)(dsTarget - ds1)*1000000000.0);
-        fprintf(stderr,"dsTarget %d\n",currentTorque);
+        //fprintf(stderr,"dsTarget %d\n",currentTorque);
         currentTorque = 0;
         v = (ds1)/dt;
         
@@ -515,7 +568,7 @@ struct ifaddrs *addrs,*tmp;
 
 getifaddrs(&addrs);
 tmp = addrs;
-std::string ifName;
+std::string ifName="wlan0";
 if(argc == 2)
 {
     ifName = argv[1];
@@ -532,9 +585,16 @@ while (tmp)
             if(ifName.length()==0 || ifName == std::string(tmp->ifa_name))
             {
                 printf("%d\n", tmp->ifa_ifu.ifu_broadaddr);
-                printf(" using interface %s\n", tmp->ifa_name);
-                printf(" using interface %s\n", inet_ntoa((in_addr)htonl(*((in_addr *)tmp->ifa_addr->sa_data))));
-                toBroadcast = new UDPComm(inet_ntoa((in_addr)htonl(*((in_addr *)tmp->ifa_addr->sa_data))),coverPort,pluginPort);
+                struct sockaddr_in *sa;
+                sa = (struct sockaddr_in *) tmp->ifa_addr;
+                char *addr = inet_ntoa(sa->sin_addr);
+                myAddress=addr;
+                printf("Interface: %s\tAddress: %s\n", tmp->ifa_name, addr);
+                sa = (struct sockaddr_in *) tmp->ifa_ifu.ifu_broadaddr;
+                addr = inet_ntoa(sa->sin_addr);
+                printf("Broadcast: %s\tAddress: %s\n", tmp->ifa_name, addr);
+                toBroadcast = new UDPComm(addr,coverPort,coverPort);
+                toBroadcast->enableBroadcast(true);
                 break;
             }
         }
@@ -547,6 +607,7 @@ if(toBroadcast==NULL)
     std::cerr << "no interface found" << std::endl;
 }
 sendDeviceInfo(toBroadcast);
+std::thread t1(processUDP);
 
 freeifaddrs(addrs);
 
@@ -632,6 +693,8 @@ freeifaddrs(addrs);
 
     printf("Starting cyclic function.\n");
     cyclic_task();
+    running=false;
+    t1.join();
 
     return 0;
 }
