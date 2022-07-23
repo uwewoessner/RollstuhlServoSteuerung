@@ -232,6 +232,7 @@ struct messageBuffer
 struct messageBufferRecv
 {
   float[3] normal;
+  float[3] direction;
   uint32_t state;
 };
 
@@ -283,7 +284,7 @@ void processUDP()
        if(toCOVER)
        {
           toCOVER->send(&mb, sizeof(mb));
-          numRead = toCOVER->receive(mbRecv,sizeof(mbRecv),0.1);
+          //numRead = toCOVER->receive(mbRecv,sizeof(mbRecv),0.1);
        }
     }
 }
