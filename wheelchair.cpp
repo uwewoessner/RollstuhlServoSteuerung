@@ -229,8 +229,14 @@ struct messageBuffer
   int64_t countRight;
   uint32_t state;
 };
+struct messageBufferRecv
+{
+  float[3] normal;
+  uint32_t state;
+};
 
 struct messageBuffer mb;
+struct messageBufferRecv mbRecv;
 
 void sendDeviceInfo(UDPComm *comm)
 {
@@ -247,7 +253,13 @@ void processUDP()
        int numRead = toBroadcast->receive(buffer,100,0);
        if(numRead > 0)
        {
-          if(numRead >= 5)
+		  if(numRead == sizeof(mbRecv))
+		  {
+			  // we received a wheelchair normal
+			  memcpy(mbRecv,buffer,sizeof(mbRecv));
+			  
+		  } 
+		  else if(numRead >= 5)
           {
             if(strcmp(buffer,"enum")==0)
             {
@@ -261,7 +273,6 @@ void processUDP()
                 char *addr = inet_ntoa(COVERAddr.sin_addr);
                 printf("COVER: %s\n", addr);
                 toCOVER = new UDPComm(addr,pluginPort,pluginPort);
-
             }
             if(strcmp(buffer,"stop")==0)
             {
@@ -271,8 +282,8 @@ void processUDP()
        }
        if(toCOVER)
        {
-       numRead = toCOVER->receive(buffer,100,0.1);
-       toCOVER->send(&mb, sizeof(mb));
+          toCOVER->send(&mb, sizeof(mb));
+          numRead = toCOVER->receive(mbRecv,sizeof(mbRecv),0.1);
        }
     }
 }
