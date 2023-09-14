@@ -223,6 +223,7 @@ const int pluginPort = 31321;
 std::string DeviceName="Wheelchair";
 bool running=true;
 
+#pragma pack(push, 1)
 struct messageBuffer
 {
   int64_t countLeft;
@@ -231,10 +232,12 @@ struct messageBuffer
 };
 struct messageBufferRecv
 {
-  float[3] normal;
-  float[3] direction;
+  float normal[3];
+  float direction[3];
+  float downhillForce;
   uint32_t state;
 };
+#pragma pack(pop)
 
 struct messageBuffer mb;
 struct messageBufferRecv mbRecv;
@@ -257,8 +260,7 @@ void processUDP()
 		  if(numRead == sizeof(mbRecv))
 		  {
 			  // we received a wheelchair normal
-			  memcpy(mbRecv,buffer,sizeof(mbRecv));
-			  
+			  memcpy(&mbRecv,buffer,sizeof(mbRecv));
 		  } 
 		  else if(numRead >= 5)
           {
@@ -408,7 +410,10 @@ void cyclic_task()
         currentTorque = (dsTarget - ds1) * -1000000000.0;
         //fprintf(stderr,"dsTarget %f\n",(float)(dsTarget - ds1)*1000000000.0);
         //fprintf(stderr,"dsTarget %d\n",currentTorque);
-        currentTorque = 0;
+        currentTorque = static_cast<int>(mbRecv.downhillForce * -1);
+        if(toCOVER == nullptr)
+            currentTorque = 0;
+        //fprintf(stderr,"dsTarget %d\n",currentTorque);
         v = (ds1)/dt;
         
 
